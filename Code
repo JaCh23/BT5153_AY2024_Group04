@@ -1,0 +1,981 @@
+# Mount Google Drive and set working directory
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+import os
+os.chdir('/content/drive/My Drive/BT5153_Project/data')
+
+!pip install shap
+!pip install lime
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+from sklearn.compose import make_column_transformer
+from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import GradientBoostingClassifier
+from xgboost import XGBClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn import tree
+from sklearn.metrics import roc_auc_score, precision_score, recall_score, accuracy_score
+from sklearn.model_selection import StratifiedKFold, GridSearchCV
+from joblib import dump
+import shap
+import lime
+from lime.lime_tabular import LimeTabularExplainer
+
+import warnings
+warnings.filterwarnings("ignore")
+
+pd.set_option('display.max_columns', None)
+flights = pd.read_csv("US_flights_2023.csv")
+flights.head()
+flights_df = flights.copy()
+# 0. Framing the Problem Statement
+Our problem statement is predicting departure delay of 60mins or more, we create target column for departure delay of 60mins or more.
+# created 2 variables for any delay or severe delay
+
+flights_df['is_delay'] = (flights_df['Dep_Delay'] > 0).astype(int)
+flights_df['is_severe_delay'] = (flights_df['Dep_Delay'] >= 60).astype(int)
+flights_df[flights_df['Dep_Delay'] >= 60]
+severe_delayed_flights_df = flights_df[flights_df['Dep_Delay'] >= 60]
+delayed_flights_df = flights_df[flights_df['Dep_Delay'] > 0]
+
+total_rows = flights_df.shape[0]
+severe_delayed_rows = severe_delayed_flights_df.shape[0]
+delayed_rows = delayed_flights_df.shape[0]
+
+severe_percentage = (severe_delayed_rows / total_rows) * 100
+percentage = (delayed_rows / total_rows) * 100
+
+print(f"Percentage of flights delayed by 60 minutes or more: {severe_percentage:.2f}%")
+print(f"Percentage of flights delayed by 0 minutes or more: {percentage:.2f}%")
+2. Since the data is temporal in nature, we need to drop features which are not avaliable during prediction.
+# keeping flight duration since it can be determined before the flight takes off
+
+flights_df.drop(columns=['Dep_Delay',
+                         'Dep_Delay_Tag',
+                         'Dep_Delay_Type',
+                         'Arr_Delay',
+                         'Arr_Delay_Type',
+                        #  'Flight_Duration',
+                         'Delay_Carrier',
+                         'Delay_Weather',
+                         'Delay_NAS',
+                         'Delay_Security',
+                         'Delay_LastAircraft'], inplace=True)
+
+flights_df.head()
+3. Finally split the training and test data, whereby flights in November and December will be our test data
+flights_df['FlightDate'] = pd.to_datetime(flights_df['FlightDate'], format='%Y-%m-%d')
+flights_df['month'] = flights_df['FlightDate'].dt.month
+test_df = flights_df[flights_df['month'] >= 11]
+test_df
+flights_df = flights_df[flights_df['month'] < 11]
+flights_df
+# 1. EDA
+## 1.1. Flights
+def plot_delay_charts(col_name):
+    # plot distributions of given varaible against any delays and severe delays
+    plt.figure(figsize=(12, 8))
+    sns.countplot(x=f'{col_name}', data=flights_df, hue='is_delay')
+    plt.xlabel(f'{col_name}')
+    plt.ylabel('Count')
+    plt.title(f'Distribution of Delays Across {col_name}')
+    plt.show()
+
+    # Explore distribution of day of week for delayed departures
+    plt.figure(figsize=(12, 8))
+    sns.countplot(x=f'{col_name}', data=flights_df, hue='is_severe_delay')
+    plt.xlabel(f'{col_name}')
+    plt.ylabel('Count')
+    plt.title(f'Distribution of Severe Delays Across {col_name}')
+    plt.show()
+plot_delay_charts('Day_Of_Week')
+Even distribution of day of week, we should drop this feature.
+# Explore distribution of count of delays for Airline for delayed departures
+airlines = flights_df.groupby('Airline')['is_delay'].value_counts().rename('count_flights_severe_delayed').reset_index()
+airlines = airlines.sort_values(by='count_flights_severe_delayed', ascending=False)
+airlines = airlines[airlines['is_delay'] == 1]
+
+plt.figure(figsize=(15, 10))
+ax = sns.barplot(x='Airline', y='count_flights_severe_delayed', data=airlines, color='steelblue')
+plt.xlabel('Airline')
+ax.set_xticklabels(ax.get_xticklabels(), rotation=60)
+plt.ylabel('Count')
+plt.title('Delays by Airlines')
+plt.show()
+
+# distribution for proportion of delays
+airlines = flights_df.groupby('Airline')['is_delay'].value_counts(normalize=True).rename('ratio_of_flights_delayed').reset_index()
+airlines = airlines.sort_values(by='ratio_of_flights_delayed', ascending=False)
+
+plt.figure(figsize=(15, 10))
+ax = sns.barplot(x='Airline', y='ratio_of_flights_delayed', data=airlines[airlines['is_delay'] == 1], color='steelblue')
+plt.xlabel('Airline')
+ax.set_xticklabels(ax.get_xticklabels(), rotation=60)
+plt.ylabel('Proportion')
+plt.title('Delays by Airlines')
+plt.show()
+# Explore count distribution
+airlines_count = flights_df.groupby('Airline')['is_severe_delay'].value_counts().rename('count_flights_severe_delayed').reset_index()
+airlines_count = airlines_count.sort_values(by='count_flights_severe_delayed', ascending=False)
+airlines_count = airlines_count[airlines_count['is_severe_delay'] == 1]
+total_count = airlines_count['count_flights_severe_delayed'].sum()
+
+plt.figure(figsize=(15, 10))
+ax = sns.barplot(x='Airline', y='count_flights_severe_delayed', data=airlines_count, color='steelblue')
+plt.xlabel('Airline')
+ax.set_xticklabels(ax.get_xticklabels(), rotation=60)
+plt.ylabel('Count')
+plt.title('Severe Delays by Airlines')
+plt.show()
+
+
+# Explore proportion distribution
+airlines_prop = flights_df.groupby('Airline')['is_severe_delay'].value_counts(normalize=True).rename('ratio_of_flights_delayed').reset_index()
+airlines_prop = airlines_prop.sort_values(by='ratio_of_flights_delayed', ascending=False)
+airlines_prop = airlines_prop[airlines_prop['is_severe_delay'] == 1]
+
+plt.figure(figsize=(15, 10))
+ax = sns.barplot(x='Airline', y='ratio_of_flights_delayed', data=airlines_prop, color='steelblue')
+plt.xlabel('Airline')
+ax.set_xticklabels(ax.get_xticklabels(), rotation=60)
+plt.ylabel('Proportion')
+plt.title('Severe Delays by Airlines')
+plt.show()
+num_airlines = len(airlines_prop['Airline'].tolist())
+
+res = []
+
+for top_k in range(num_airlines):
+    top_k_airlines = airlines_prop['Airline'].head(top_k).tolist()
+    filtered_count = airlines_count[airlines_count['Airline'].isin(top_k_airlines)]
+
+    total_severe_delays = filtered_count['count_flights_severe_delayed'].sum()
+    prop_captured = total_severe_delays/total_count
+    res.append([top_k, prop_captured])
+
+res = pd.DataFrame(res, columns=['K', 'Proportion'], index=None)
+
+plt.figure(figsize=(8, 6))
+plt.bar(res['K'], res['Proportion'], color='steelblue')
+plt.xlabel('Top K Airlines Based on Proportion')
+plt.ylabel('Total Proportion of Severely Delayed Flights Captured')
+plt.xticks(rotation=0)
+plt.tight_layout()
+plt.show()
+res.head(10)
+Note the above 2 charts representing airlines against any delay and severe delays, where the names of airlines that appear are slightly different. Nevertheless, we stick to severe delays as that is our business context.
+
+We have 2 visualisations, one on airlines against count of flights severely delayed, and the other based on proportion. Do note these lists do not tally up, eg. American Airlines has the greatest severely delayed flights but does not have the greatest corresponding proportion; vice versa forJetBlue.
+
+We see that some airlines are more prone to delays. We can reduce dimensionality by grouping the Top K Airlines individually, and all other airlines into an 'Others' category. Here, we select the Top 7 which captures 63% of the total severely delayed flights, where airlines Delta Air Lines Inc onwards are bundled together as 'Others'. We would do this step later on under Feature Engineering.
+# Explore count distribution Departure Airport for delayed departures
+dep_airports_count = flights_df.groupby('Dep_Airport')['is_severe_delay'].value_counts().rename('count_flights_severe_delayed').reset_index()
+dep_airports_count = dep_airports_count.sort_values(by='count_flights_severe_delayed', ascending=False)
+dep_airports_count = dep_airports_count[dep_airports_count['is_severe_delay'] == 1]
+total_count = dep_airports_count['count_flights_severe_delayed'].sum()
+
+plt.figure(figsize=(15, 10))
+ax = sns.barplot(x='Dep_Airport', y='count_flights_severe_delayed', data=dep_airports_count, color='steelblue')
+plt.xlabel('Airport')
+ax.set_xticklabels(ax.get_xticklabels(), rotation=90)
+plt.ylabel('Count')
+plt.title('Delays by Departure Airport')
+plt.show()
+
+# Explore proportion distribution
+dep_airports = flights_df.groupby('Dep_Airport')['is_severe_delay'].value_counts(normalize=True).rename('ratio_of_flights_delayed').reset_index()
+dep_airports = dep_airports.sort_values(by='ratio_of_flights_delayed', ascending=False)
+dep_airports = dep_airports[dep_airports['is_severe_delay'] == 1]
+
+plt.figure(figsize=(15, 10))
+ax = sns.barplot(x='Dep_Airport', y='ratio_of_flights_delayed', data=dep_airports, color='steelblue')
+plt.xlabel('Airport')
+ax.set_xticklabels(ax.get_xticklabels(), rotation=90)
+plt.ylabel('Proportion')
+plt.title('Delays by Departure Airport')
+plt.show()
+num_airports = len(dep_airports['Dep_Airport'].tolist())
+num_airports
+res = []
+
+for top_k in range(num_airports):
+    top_k_airlines = dep_airports['Dep_Airport'].head(top_k).tolist()
+    filtered_count = dep_airports_count[dep_airports_count['Dep_Airport'].isin(top_k_airlines)]
+
+    total_severe_delays = filtered_count['count_flights_severe_delayed'].sum()
+    prop_captured = total_severe_delays/total_count
+    res.append([top_k, prop_captured])
+
+res = pd.DataFrame(res, columns=['K', 'Proportion'], index=None)
+
+plt.figure(figsize=(8, 6))
+plt.bar(res['K'], res['Proportion'], color='steelblue')
+plt.xlabel('Top K Airlines Based on Proportion')
+plt.ylabel('Total Proportion of Severely Delayed Flights Captured')
+plt.xticks(rotation=0)
+plt.tight_layout()
+plt.show()
+thresholds = np.arange(0,1,0.1).round(1)
+results_df = pd.DataFrame(columns=['Proportion Captured', 'K'])
+
+for threshold in thresholds:
+  # Find the first index where 'Proportion' is greater than the threshold
+  first_above_threshold = res[res['Proportion'] > threshold].index[0]
+  k_value = res.loc[first_above_threshold, 'K']
+  results_df = results_df.append({'Proportion Captured': threshold, 'K': k_value}, ignore_index=True)
+
+results_df
+We see there are many airports involved and we observe a general skewed distribution in flight delays towards some airports. Hence, for our analysis we take only the top 50 departure airports.
+TOP_K_AIRPORTS = 50
+
+# Explore distribution Departure Airport for delayed departures
+plt.figure(figsize=(15, 10))
+
+dep_airports = flights_df.groupby('Dep_Airport')['is_severe_delay'].value_counts(normalize=True).rename('ratio_of_flights_delayed').reset_index()
+dep_airports = dep_airports.sort_values(by='ratio_of_flights_delayed', ascending=False)
+dep_airports = dep_airports[dep_airports['is_severe_delay'] == 1]
+
+ax = sns.barplot(x='Dep_Airport', y='ratio_of_flights_delayed', data=dep_airports.head(TOP_K_AIRPORTS), color='steelblue')
+plt.xlabel('Airport')
+ax.set_xticklabels(ax.get_xticklabels(), rotation=90)
+plt.ylabel('Proportion')
+plt.title(f"Top {TOP_K_AIRPORTS} Departure Airports by Delays")
+plt.show()
+Top 5 Departure Airports with > 15% delays for the 1st 10 months of 2023:
+- Santa Maria Public Airport (SMX)
+- Stockton Metropolitan Airport (SCK)
+- Rafael Hernández International Airport (BQN)
+- Martha's Vineyard Airport (MVY)
+- Yellowstone Regional Airport (COD)
+# Take only the top 50 departure airports
+dep_airports = dep_airports.head(TOP_K_AIRPORTS)
+sns.kdeplot(dep_airports['ratio_of_flights_delayed'], fill=True)
+plt.title('Density Plot of Ratio Values')
+plt.xlabel('Ratio')
+plt.ylabel('Density')
+plt.grid(True)
+plt.show()
+Can we use the ratio as quantitaive description of the airport infrastructure and geographic location?
+plot_delay_charts('DepTime_label')
+Occurence of any delays seem to happen most often in the afternoon and evenings, same observation too for severe delays.
+# Explore distribution Arrival Airport for delayed departures
+plt.figure(figsize=(15, 10))
+
+arr_airpots = flights_df.groupby('Arr_Airport')['is_severe_delay'].value_counts(normalize=True).rename('ratio_of_dep_delayed').reset_index()
+arr_airpots = arr_airpots.sort_values(by='ratio_of_dep_delayed', ascending=False)
+arr_airpots = arr_airpots[arr_airpots['is_severe_delay'] == 1]
+
+# Take only the top 50 arrival airports
+arr_airpots = arr_airpots.head(50)
+
+ax = sns.barplot(x='Arr_Airport', y='ratio_of_dep_delayed', data=arr_airpots, color='steelblue')
+plt.xlabel('Airport')
+ax.set_xticklabels(ax.get_xticklabels(), rotation=90)
+plt.ylabel('Proportion')
+plt.title('Top 50 Arrival Airports by Delays')
+plt.show()
+Top 4 Arrival Airports with > 15% delays for the 1st 10 months of 2023:
+- Mercedita International Airport (PSE)
+- Rafael Hernández International Airport (BQN)
+- Provo Municipal Airport (PVU)
+- Trenton–Mercer Airport (TTN)
+
+Do note we are not so concerned with this data as we are focused on departure related delays.
+plot_delay_charts('Distance_type')
+# Explore distribution Arrival Airport for delayed departures
+models = flights_df.groupby('Model')['is_delay'].value_counts(normalize=True).rename('ratio_of_dep_delayed').reset_index()
+models = models.sort_values(by='ratio_of_dep_delayed', ascending=False)
+models = models[models['is_delay'] == 1]
+
+plt.figure(figsize=(15, 10))
+ax = sns.barplot(x='Model', y='ratio_of_dep_delayed', data=models, color='steelblue')
+plt.xlabel('Models')
+ax.set_xticklabels(ax.get_xticklabels(), rotation=90)
+plt.ylabel('Proportion')
+plt.title('Delays by Model')
+plt.show()
+
+
+# Explore distribution Arrival Airport for severe delayed departures
+models = flights_df.groupby('Model')['is_severe_delay'].value_counts(normalize=True).rename('ratio_of_dep_delayed').reset_index()
+models = models.sort_values(by='ratio_of_dep_delayed', ascending=False)
+models = models[models['is_severe_delay'] == 1]
+
+plt.figure(figsize=(15, 10))
+ax = sns.barplot(x='Model', y='ratio_of_dep_delayed', data=models, color='steelblue')
+plt.xlabel('Models')
+ax.set_xticklabels(ax.get_xticklabels(), rotation=90)
+plt.ylabel('Proportion')
+plt.title('Severe Delays by Model')
+plt.show()
+Something wrong with DA40
+fig, ax = plt.subplots()
+sns.kdeplot(flights_df[flights_df['is_delay']==1]['Aicraft_age'], shade=True, color="blue", label="Delay", ax=ax)
+sns.kdeplot(flights_df[flights_df['is_delay']==0]['Aicraft_age'], shade=True, color="green", label="Normal", ax=ax)
+ax.set_xlabel("Aircraft Age")
+ax.set_ylabel("Proportion")
+fig.suptitle("Aircraft Age vs Delay")
+
+fig, ax = plt.subplots()
+sns.kdeplot(flights_df[flights_df['is_severe_delay']==1]['Aicraft_age'], shade=True, color="blue", label="Severe Delay", ax=ax)
+sns.kdeplot(flights_df[flights_df['is_severe_delay']==0]['Aicraft_age'], shade=True, color="green", label="Normal", ax=ax)
+ax.set_xlabel("Aircraft Age")
+ax.set_ylabel("Proportion")
+fig.suptitle("Aircraft Age vs Severe Delay")
+## 1.2. Weather
+weather_path = "weather_meteo_by_airport.csv"
+
+df_weather = pd.read_csv(weather_path)
+df_weather = df_weather.rename(columns={'time': 'FlightDate'})
+df_weather['FlightDate'] = pd.to_datetime(df_weather['FlightDate'])
+df_weather.head(10)
+# 2. Feature Engineering
+## 2.1 Explaining the Feature Engineering Process
+df = flights_df.copy()
+df
+1. Reduce dimensionality by limiting the number of Airlines
+
+As discussed above, we select the Top 7 airlines ranked in terms of proportion of severely delayed flights, which captures 63% of all severely delayed flights overall.
+TOP_K = 7
+
+# Airline to focus only on the Airlines with higher
+airlines = flights_df.groupby('Airline')['is_severe_delay'].value_counts(normalize=True).rename('ratio_of_flights_delayed').reset_index()
+airlines = airlines.sort_values(by='ratio_of_flights_delayed', ascending=False)
+top_airlines = list(airlines[airlines['is_severe_delay'] == 1].head(TOP_K)['Airline'])
+
+# Replace values not in 'top_airlines' with 'Others'
+df['Airline'] = df['Airline'].apply(lambda x: x if x in top_airlines else 'Others')
+df['Airline'].unique()
+2. Create a feature to indicate if model is DA40
+df['isDA40'] = (df['Model'] == 'DA40').astype(int)
+df.head()
+3. Assign delay probability based on past data to departure airport
+dep_airports = flights_df.groupby('Dep_Airport')['is_severe_delay'].value_counts(normalize=True).rename('dep_airport_ratio').reset_index()
+dep_airports = dep_airports.sort_values(by='dep_airport_ratio', ascending=False)
+dep_airports = dep_airports[dep_airports['is_severe_delay'] == 1]
+dep_airports_sub = dep_airports[['Dep_Airport', 'dep_airport_ratio']]
+
+df = pd.merge(df, dep_airports_sub, on='Dep_Airport', how='inner')
+df
+## 2.1.2. Weather Feature Engineering
+# feature engineering
+TAKEOFF_DRY_LIMIT = 33*1.852
+TAKEOFF_WET_LIMIT = 27*1.852
+
+# 0 for freezing since we are in Celsius measurement scale
+df_weather['is_below_freezing'] = df_weather['tavg'].apply(lambda x: x < 0).astype(int)
+df_weather['is_max_below_freezing'] = df_weather['tmax'].apply(lambda x: x < 0).astype(int)
+
+df_weather['is_prcp'] = df_weather['prcp'].apply(lambda x: x > 0).astype(int)
+df_weather['is_snow'] = df_weather['snow'].apply(lambda x: x > 0).astype(int)
+
+df_weather['is_exceed_wind_limit'] = df_weather.apply(lambda row: row['wspd'] >= TAKEOFF_WET_LIMIT if row['is_prcp'] else row['wspd'] >= TAKEOFF_DRY_LIMIT, axis=1).astype(int)
+df_weather.head()
+df_depart_weather = df_weather.copy()
+
+df_depart_weather = df_depart_weather.rename(columns=lambda x: f'dep_{x}')
+df_depart_weather = df_depart_weather.rename(columns={'dep_airport_id': 'Dep_Airport', 'dep_FlightDate': 'FlightDate'})
+df_depart_weather
+# Merge
+df = pd.merge(df, df_depart_weather, on=['Dep_Airport', 'FlightDate'], how='left')
+df
+df.drop(columns=['FlightDate', 'Tail_Number', 'Dep_Airport', 'Dep_CityName', 'Arr_Airport', 'Arr_CityName', 'Manufacturer', 'Model', 'month'], inplace=True)
+df.head()
+## 2.2 Define Feature Engineering Functions
+def get_Airlines(df):
+    airlines = df.groupby('Airline')['is_severe_delay'].value_counts(normalize=True).rename('ratio_of_flights_delayed').reset_index()
+    airlines = airlines.sort_values(by='ratio_of_flights_delayed', ascending=False)
+    top_airlines = list(airlines[airlines['is_severe_delay'] == 1].head(7)['Airline'])
+
+    df['Airline'] = df['Airline'].apply(lambda x: x if x in top_airlines else 'Others')
+    return df, top_airlines
+
+def get_dep_airport_ratio(df):
+    dep_airports = df.groupby('Dep_Airport')['is_severe_delay'].value_counts(normalize=True).rename('dep_airport_ratio').reset_index()
+    dep_airports = dep_airports.sort_values(by='dep_airport_ratio', ascending=False)
+    dep_airports = dep_airports[dep_airports['is_severe_delay'] == 1]
+    dep_airports_sub = dep_airports[['Dep_Airport', 'dep_airport_ratio']]
+
+    df = pd.merge(df, dep_airports_sub, on='Dep_Airport', how='inner')
+    return df, dep_airports_sub
+
+def model_DA40(df):
+    df['isDA40'] = (df['Model'] == 'DA40').astype(int)
+    return df
+
+def weather_features(df):
+    df = pd.merge(df, df_depart_weather, on=['Dep_Airport', 'FlightDate'], how='left')
+    return df
+
+# Drop all the unwanted features
+def drop_columns(df):
+    columns_to_drop = ['FlightDate', 'Tail_Number', 'Dep_Airport', 'Dep_CityName', 'Arr_Airport', 'Arr_CityName', 'Manufacturer', 'Model', 'month']
+    return df.drop(columns_to_drop, axis=1)
+# 3. Column Transformers
+flights_df.columns
+flights_df['Distance_type'].unique()
+categorical_features = ['Day_Of_Week', 'Airline', 'DepTime_label']
+distances = ['Short Haul >1500Mi', 'Medium Haul <3000Mi', 'Long Haul <6000Mi']
+onehot_encoder = OneHotEncoder(sparse_output = False)
+
+feature_transform = make_column_transformer(
+    (onehot_encoder, categorical_features),
+    (OrdinalEncoder(categories = [distances]), ['Distance_type']),
+    remainder='passthrough'
+    )
+
+feature_transform
+# 4. Create Models
+log = LogisticRegression(penalty = None,class_weight = 'balanced', max_iter=1000)
+dt = tree.DecisionTreeClassifier(max_depth=5, random_state=42)
+rf = RandomForestClassifier(n_estimators=100, max_features='sqrt', max_depth=5)
+gbc = GradientBoostingClassifier(n_estimators = 100,  max_depth= 5)
+xgb = XGBClassifier(n_estimators=100, max_depth=5)
+xgbg = XGBClassifier()
+pipeline_log = Pipeline([
+    ('feature_transform', feature_transform),
+    ('scaler', StandardScaler()),
+    ('logistic_regression', log)
+])
+
+pipeline_dt = Pipeline([
+    ('feature_transform', feature_transform),
+    ('scaler', StandardScaler()),
+    ('decision_tree', dt)
+])
+
+pipeline_rf = Pipeline([
+    ('feature_transform', feature_transform),
+    ('scaler', StandardScaler()),
+    ('random_forest', rf)
+])
+
+pipeline_gbc = Pipeline([
+    ('feature_transform', feature_transform),
+    ('scaler', StandardScaler()),
+    ('gradient_boosting', gbc)
+])
+
+pipeline_xgb = Pipeline([
+    ('feature_transform', feature_transform),
+    ('scaler', StandardScaler()),
+    ('xgboost', xgb)
+])
+
+pipeline_xgb_grid = Pipeline([
+    ('feature_transform', feature_transform),
+    ('scaler', StandardScaler()),
+    ('xgboost', xgbg)
+])
+# 5. Train Models
+## 5.1 Training set
+# Preliminary feature processing
+
+df = flights_df.copy()
+df, top_airlines = get_Airlines(df)
+df, dep_airports_sub = get_dep_airport_ratio(df)
+df = model_DA40(df)
+df = weather_features(df)
+final_df = drop_columns(df)
+final_df.head()
+### 5.1.1. Severe Delay Analysis
+X_train = final_df.copy()
+X_train.drop(columns=['is_severe_delay', 'is_delay'], inplace=True)
+y_train = df['is_severe_delay']
+X_train.head()
+pipeline_rf_severe = pipeline_rf
+pipeline_rf_severe.fit(X_train, y_train)
+# Predict probabilities for AUC-ROC
+y_probs = pipeline_rf_severe.predict_proba(X_train)[:, 1]
+
+# Calculate AUC-ROC
+roc_auc = roc_auc_score(y_train, y_probs)
+print("AUC-ROC Score:", roc_auc)
+# Get the feature names output by the ColumnTransformer
+feature_names = pipeline_rf_severe[:-1].get_feature_names_out()
+feature_names
+# doing feature importance analysis using RF
+
+# Access the random forest estimator
+rf = pipeline_rf_severe.named_steps['random_forest']
+
+# Get feature importances
+rf_importances = rf.feature_importances_
+
+# printing everything
+order = np.flip(np.argsort(rf_importances))[:]
+plt.barh(range(len(rf_importances)),
+         rf_importances[order],
+         tick_label=feature_names[order])
+plt.title("Relative Feature Importance for RF")
+
+# Specify the number of top features to print (K)
+K = 10
+
+order = np.flip(np.argsort(rf_importances))[:K]
+plt.barh(range(K),
+         rf_importances[order],
+         tick_label=feature_names[order])
+plt.title("Relative Feature Importance for RF")
+# SHAP analysis for explainability
+
+# subsampling 10K from original training dataset as proxy, since whole training dataset is very huge
+chosen_instance = X_train.sample(10000, random_state=42)
+explainer = shap.TreeExplainer(pipeline_rf_severe['random_forest'])
+
+#apply the preprocessing to x_test
+observations = pipeline_rf_severe['feature_transform'].transform(chosen_instance)
+observations = pipeline_rf_severe['scaler'].transform(observations)
+
+#get Shap values from preprocessed data
+shap_values = explainer.shap_values(observations)
+
+#plot the feature importance
+shap.summary_plot(shap_values, features=observations, feature_names=feature_names)
+idx = 987
+samp = chosen_instance.iloc[[idx]]
+samp
+#apply the preprocessing to x_test
+samp_obv = pipeline_rf_severe['feature_transform'].transform(samp)
+samp_obv = pipeline_rf_severe['scaler'].transform(samp_obv)
+
+#get Shap values from preprocessed data
+shap.initjs()
+shap_values = explainer.shap_values(samp_obv)
+shap.force_plot(explainer.expected_value[1], shap_values[1], feature_names)
+idx = 798
+samp = chosen_instance.iloc[[idx]]
+samp
+#apply the preprocessing to x_test
+samp_obv = pipeline_rf_severe['feature_transform'].transform(samp)
+samp_obv = pipeline_rf_severe['scaler'].transform(samp_obv)
+
+#get Shap values from preprocessed data
+shap.initjs()
+shap_values = explainer.shap_values(samp_obv)
+shap.force_plot(explainer.expected_value[1], shap_values[1], feature_names)
+idx = 847
+samp = chosen_instance.iloc[[idx]]
+samp
+#apply the preprocessing to x_test
+samp_obv = pipeline_rf_severe['feature_transform'].transform(samp)
+samp_obv = pipeline_rf_severe['scaler'].transform(samp_obv)
+
+#get Shap values from preprocessed data
+shap.initjs()
+shap_values = explainer.shap_values(samp_obv)
+shap.force_plot(explainer.expected_value[1], shap_values[1], feature_names)
+# LIME analysis for explainability
+
+# subsampling 10K from original training dataset as proxy, since whole training dataset is very huge
+chosen_instance = X_train.sample(10000, random_state=42)
+
+#apply the preprocessing to x_test
+observations = pipeline_rf_severe['feature_transform'].transform(chosen_instance)
+observations = pipeline_rf_severe['scaler'].transform(observations)
+
+explainer = LimeTabularExplainer(observations,
+                                 feature_names=feature_names,
+                                 class_names = ['normal', 'severe_delay'],
+                                 mode='classification')
+j = 5
+exp = explainer.explain_instance(observations[j], pipeline_rf_severe['random_forest'].predict_proba)
+exp.show_in_notebook(show_table=True)
+exp.as_pyplot_figure();
+j = 47
+exp = explainer.explain_instance(observations[j], pipeline_rf_severe['random_forest'].predict_proba)
+exp.show_in_notebook(show_table=True)
+exp.as_pyplot_figure();
+j = 869
+exp = explainer.explain_instance(observations[j], pipeline_rf_severe['random_forest'].predict_proba)
+exp.show_in_notebook(show_table=True)
+exp.as_pyplot_figure();
+# GBC as model
+pipeline_gbc_severe = pipeline_gbc
+pipeline_gbc_severe.fit(X_train, y_train)
+# Predict probabilities for AUC-ROC
+y_probs = pipeline_gbc_severe.predict_proba(X_train)[:, 1]
+
+# Calculate AUC-ROC
+roc_auc = roc_auc_score(y_train, y_probs)
+print("AUC-ROC Score:", roc_auc)
+# Get the feature names output by the ColumnTransformer
+feature_names_gbc = pipeline_gbc_severe[:-1].get_feature_names_out()
+feature_names_gbc
+# doing feature importance analysis using RF
+
+# Access the random forest estimator
+gradient_boosting = pipeline_gbc_severe.named_steps['gradient_boosting']
+
+# Get feature importances
+gbc_importances = gradient_boosting.feature_importances_
+
+# printing everything
+order = np.flip(np.argsort(gbc_importances))[:]
+plt.barh(range(len(gbc_importances)),
+         gbc_importances[order],
+         tick_label=feature_names_gbc[order])
+plt.title("Relative Feature Importance for GBC")
+
+# Specify the number of top features to print (K)
+K = 10
+
+order = np.flip(np.argsort(gbc_importances))[:K]
+plt.barh(range(K),
+         gbc_importances[order],
+         tick_label=feature_names_gbc[order])
+plt.title("Relative Feature Importance for GBC")
+Observations (GBC compared against RF):
+- New features: Flight duration, aircraft age
+- Consistent in both models: Precipiation, departure time, temperature
+pipeline_xgb_severe = pipeline_xgb
+pipeline_xgb_severe.fit(X_train, y_train)
+# Predict probabilities for AUC-ROC
+y_probs = pipeline_xgb_severe.predict_proba(X_train)[:, 1]
+
+# Calculate AUC-ROC
+roc_auc = roc_auc_score(y_train, y_probs)
+print("AUC-ROC Score:", roc_auc)
+# Get the feature names output by the ColumnTransformer
+feature_names_xgb = pipeline_xgb_severe[:-1].get_feature_names_out()
+feature_names_xgb
+# Access the random forest estimator
+xgb_step = pipeline_xgb_severe.named_steps['xgboost']
+
+# Get feature importances
+xgb_importances = xgb_step.feature_importances_
+
+# printing everything
+order = np.flip(np.argsort(xgb_importances))[:]
+plt.barh(range(len(xgb_importances)),
+         xgb_importances[order],
+         tick_label=feature_names_xgb[order])
+plt.title("Relative Feature Importance for XGB")
+# Specify the number of top features to print (K)
+K = 10
+
+order = np.flip(np.argsort(xgb_importances))[:K]
+plt.barh(range(K),
+         xgb_importances[order],
+         tick_label=feature_names_xgb[order])
+plt.title("Relative Feature Importance for XGB")
+Observations across all 3 models:
+- XGB new features (against GBC and RF): Airline type
+- GBC New features (against RF): Flight duration, aircraft age
+- Consistent in all models: Precipiation, departure time, temperature
+
+Analysis:
+- XGB can be argued to have bias since it is classifying based on airline models
+- All 3 models using roughly same parameters (estimators of 100, max depth of 5) have roughly same accuracy of about 0.7
+- AUC training: RF < GBC < XGB
+- Speed: XGB < RF << GBC
+- Since XGB is a good balance of speed and accuracy, we experiment with XGB with more parameters
+### 5.1.2. Is Delay Analysis
+y_train = df['is_delay']
+pipeline_rf_any = pipeline_rf
+pipeline_rf_any.fit(X_train, y_train)
+# Predict probabilities for AUC-ROC
+y_probs = pipeline_rf_any.predict_proba(X_train)[:, 1]
+
+# Calculate AUC-ROC
+roc_auc = roc_auc_score(y_train, y_probs)
+print("AUC-ROC Score:", roc_auc)
+# Get the feature names output by the ColumnTransformer
+feature_names = pipeline_rf_any[:-1].get_feature_names_out()
+feature_names
+# Access the random forest estimator
+rf = pipeline_rf_any.named_steps['random_forest']
+
+# Get feature importances
+rf_importances = rf.feature_importances_
+
+# printing everything
+order = np.flip(np.argsort(rf_importances))[:]
+plt.barh(range(len(rf_importances)),
+         rf_importances[order],
+         tick_label=feature_names[order])
+plt.title("Relative Feature Importance for RF")
+
+# Specify the number of top features to print (K)
+K = 10
+
+order = np.flip(np.argsort(rf_importances))[:K]
+plt.barh(range(K),
+         rf_importances[order],
+         tick_label=feature_names[order])
+plt.title("Relative Feature Importance for RF")
+Observations (Any Delays):
+- Time of day identified as an important feature
+- Followed by events relating to precipitation and temperature
+
+Observations to Severe Delays follow similar patterns.
+### 5.1.3. Correlation Analysis
+# Calculate correlation matrix (considering numerical features)
+corr_df = final_df.copy()
+
+correlation_matrix = corr_df.select_dtypes('number').corr()
+delay_corr = correlation_matrix['is_delay']
+
+# Create heatmap
+plt.figure(figsize=(2, 15))
+heatmap = sns.heatmap(delay_corr.to_frame(), annot=True, cmap='coolwarm', center=0, fmt=".2f")
+heatmap.set_xticklabels(heatmap.get_xticklabels(), rotation=45)  # Rotate x-axis labels for better readability
+plt.title('Correlation heatmap with Any Delays')
+plt.show()
+delay_corr = correlation_matrix['is_severe_delay']
+
+# Create heatmap
+plt.figure(figsize=(2, 15))
+heatmap = sns.heatmap(delay_corr.to_frame(), annot=True, cmap='coolwarm', center=0, fmt=".2f")
+heatmap.set_xticklabels(heatmap.get_xticklabels(), rotation=45)  # Rotate x-axis labels for better readability
+plt.title('Correlation heatmap with Severe Delays')
+plt.show()
+Observations:
+- Occurrence of delay is correlated with severe delays (trivial observation)
+- Model being Is DA40 or not has no direct correlation
+## 5.2 Evaluation
+df2 = test_df.copy()
+df2['Airline'] = df2['Airline'].apply(lambda x: x if x in top_airlines else 'Others')
+df2 = pd.merge(df2, dep_airports_sub, on='Dep_Airport', how='inner')
+df2 = model_DA40(df2)
+df2 = weather_features(df2)
+df2 = drop_columns(df2)
+df2
+# Create X_train and y_train
+X_test = df2.copy()
+X_test.drop(columns='is_severe_delay', inplace=True)
+y_test = df2['is_severe_delay']
+# Perform predictions on the test set using the fitted pipeline
+
+# Predict probabilities for AUC-ROC
+y_probs = pipeline_rf.predict_proba(X_test)[:, 1]
+
+# Calculate AUC-ROC
+roc_auc = roc_auc_score(y_test, y_probs)
+print("AUC-ROC Score:", roc_auc)
+def train_and_predict(model_pipeline, X_train, y_train, X_test):
+    model_pipeline.fit(X_train, y_train)
+    pred_prob_train = model_pipeline.predict_proba(X_train)[:, 1]  # Probabilities for the positive class
+    pred_prob_test = model_pipeline.predict_proba(X_test)[:, 1]
+    pred_train = model_pipeline.predict(X_train)
+    pred_test = model_pipeline.predict(X_test)
+    return pred_prob_train, pred_prob_test, pred_train, pred_test
+
+def calculate_metrics(y_train, pred_prob_train, pred_train, y_test, pred_prob_test, pred_test):
+    metrics = {
+        'Training AUC': roc_auc_score(y_train, pred_prob_train),
+        'Testing AUC': roc_auc_score(y_test, pred_prob_test),
+        'Training Precision': precision_score(y_train, pred_train),
+        'Testing Precision': precision_score(y_test, pred_test),
+        'Training Recall': recall_score(y_train, pred_train),
+        'Testing Recall': recall_score(y_test, pred_test),
+        'Training Accuracy': accuracy_score(y_train, pred_train),
+        'Testing Accuracy': accuracy_score(y_test, pred_test)
+    }
+    return metrics
+
+# List of models and their pipelines
+models = [
+    ('Logistic Regression', pipeline_log),
+    ('Decision Tree', pipeline_dt),
+    ('Random Forest', pipeline_rf),
+    ('Gradient Boosting Classifier', pipeline_gbc),
+    ('XGBoost Classifier', pipeline_xgb)
+]
+
+# Initialize an empty list to store results
+results = []
+
+# Loop through the models, train, predict, and calculate metrics
+for name, model in models:
+    pred_prob_train, pred_prob_test, pred_train, pred_test = train_and_predict(model, X_train, y_train, X_test)
+    metrics = calculate_metrics(y_train, pred_prob_train, pred_train, y_test, pred_prob_test, pred_test)
+    results.append({'Model': name, **metrics})
+
+# Convert the results into a DataFrame
+model_scores = pd.DataFrame(results)
+
+# Display the models' scores
+model_scores
+pipeline_xgb_grid
+# Parameters to search over
+param_grid = {
+    'xgboost__n_estimators': [100,150,200],
+    'xgboost__max_depth': [5,10,15]
+}
+
+### Validator ###
+cv = StratifiedKFold(n_splits = 5, shuffle = True, random_state = 2024)
+
+## GridSearch ###
+grid = GridSearchCV(pipeline_xgb_grid,
+                    param_grid,
+                    scoring = ['precision', 'recall', 'f1', 'balanced_accuracy','roc_auc'],
+                    refit = 'roc_auc',
+                    cv = cv,
+                   )
+
+grid.fit(X_train, y_train)
+best_score = grid.best_score_
+print("Best score:", best_score)
+best_estimator = grid.best_estimator_
+print("Best estimator:", best_estimator)
+# Get the best model
+best_model = grid.best_estimator_
+
+# Save the best model
+dump(best_model, 'best_model.joblib')
+results = pd.DataFrame(grid.cv_results_)
+results
+## 5.3 Best Model Explanability
+from joblib import load
+
+# Load the model from the file
+pipeline_xgb_best = load('best_model.joblib')
+
+pipeline_xgb_best
+# Get the feature names output by the ColumnTransformer
+feature_names = pipeline_xgb_best[:-1].get_feature_names_out()
+feature_names
+# doing feature importance analysis using xgb
+
+# Access the xgboost estimator
+xgb = pipeline_xgb_best.named_steps['xgboost']
+
+# Get feature importances
+xgb_importances = xgb.feature_importances_
+
+# printing everything
+order = np.flip(np.argsort(xgb_importances))[:]
+plt.barh(range(len(xgb_importances)),
+         xgb_importances[order],
+         tick_label=feature_names[order])
+plt.title("Relative Feature Importance for XGB")
+
+# Specify the number of top features to print (K)
+K = 10
+
+order = np.flip(np.argsort(xgb_importances))[:K]
+plt.barh(range(K),
+         xgb_importances[order],
+         tick_label=feature_names[order])
+plt.title("Relative Feature Importance for XGB")
+# SHAP analysis for explainability
+
+# subsampling 10K from original training dataset as proxy, since whole training dataset is very huge
+chosen_instance = X_train.sample(10000, random_state=42)
+explainer = shap.TreeExplainer(pipeline_xgb_best.named_steps['xgboost'])
+
+#apply the preprocessing to x_test
+observations = pipeline_xgb_best['feature_transform'].transform(chosen_instance)
+observations = pipeline_xgb_best['scaler'].transform(observations)
+
+#get Shap values from preprocessed data
+shap_values = explainer.shap_values(observations)
+
+#plot the feature importance
+shap.summary_plot(shap_values, features=observations, feature_names=feature_names)
+idx = 987
+samp = chosen_instance.iloc[[idx]]
+samp
+#apply the preprocessing to x_test
+samp_obv = pipeline_xgb_best['feature_transform'].transform(samp)
+samp_obv = pipeline_xgb_best['scaler'].transform(samp_obv)
+
+#get Shap values from preprocessed data
+shap.initjs()
+shap_values = explainer.shap_values(samp_obv)
+shap.force_plot(explainer.expected_value, shap_values, feature_names)
+
+idx = 798
+samp = chosen_instance.iloc[[idx]]
+samp
+#apply the preprocessing to x_test
+samp_obv = pipeline_xgb_best['feature_transform'].transform(samp)
+samp_obv = pipeline_xgb_best['scaler'].transform(samp_obv)
+
+#get Shap values from preprocessed data
+shap.initjs()
+shap_values = explainer.shap_values(samp_obv)
+shap.force_plot(explainer.expected_value, shap_values, feature_names)
+idx = 847
+samp = chosen_instance.iloc[[idx]]
+samp
+#apply the preprocessing to x_test
+samp_obv = pipeline_xgb_best['feature_transform'].transform(samp)
+samp_obv = pipeline_xgb_best['scaler'].transform(samp_obv)
+
+#get Shap values from preprocessed data
+shap.initjs()
+shap_values = explainer.shap_values(samp_obv)
+shap.force_plot(explainer.expected_value, shap_values, feature_names)
+idx = 836
+samp = chosen_instance.iloc[[idx]]
+samp
+#apply the preprocessing to x_test
+samp_obv = pipeline_xgb_best['feature_transform'].transform(samp)
+samp_obv = pipeline_xgb_best['scaler'].transform(samp_obv)
+
+#get Shap values from preprocessed data
+shap.initjs()
+shap_values = explainer.shap_values(samp_obv)
+shap.force_plot(explainer.expected_value, shap_values, feature_names)
+import numpy as np
+import shap
+
+# Define the logistic function
+def logistic(x):
+    return 1 / (1 + np.exp(-x))
+
+# Assuming `explainer` and `shap_values` have been previously defined
+# Example of calculating base probability
+base_value = explainer.expected_value
+base_probability = logistic(base_value)
+
+# Assume we have shap_values for a specific prediction
+individual_shap_values = shap_values[0]  # For the first prediction
+
+# Calculate the adjusted log odds
+adjusted_log_odds = base_value + individual_shap_values
+
+# Calculate the final probability
+final_probability = logistic(adjusted_log_odds)
+
+# Plot the SHAP force plot using probabilities instead of log odds
+shap.initjs()
+# Modify the expected value and SHAP values for the visualization
+shap.force_plot(base_probability, logistic(individual_shap_values),
+                feature_names=feature_names,
+                link='logit')  # This ensures that the logistic function is used in the visualization
+
+# LIME analysis for explainability
+
+# subsampling 10K from original training dataset as proxy, since whole training dataset is very huge
+chosen_instance = X_train.sample(10000, random_state=42)
+
+#apply the preprocessing to x_test
+observations = pipeline_xgb_best['feature_transform'].transform(chosen_instance)
+observations = pipeline_xgb_best['scaler'].transform(observations)
+
+explainer = LimeTabularExplainer(observations,
+                                 feature_names=feature_names,
+                                 class_names = ['normal', 'severe_delay'],
+                                 mode='classification')
+j = 5
+exp = explainer.explain_instance(observations[j], pipeline_xgb_best['xgboost'].predict_proba)
+exp.show_in_notebook(show_table=True)
+exp.as_pyplot_figure();
+j = 47
+exp = explainer.explain_instance(observations[j], pipeline_xgb_best['xgboost'].predict_proba)
+exp.show_in_notebook(show_table=True)
+exp.as_pyplot_figure();
+j = 869
+exp = explainer.explain_instance(observations[j], pipeline_xgb_best['xgboost'].predict_proba)
+exp.show_in_notebook(show_table=True)
+exp.as_pyplot_figure();
